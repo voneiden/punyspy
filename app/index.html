@@ -1,12 +1,24 @@
 <!DOCTYPE HTML>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Main</title>
-  <!--<link rel="stylesheet" href="whatever-you-want.css">-->
+  <title>Spybus</title>
+  <link rel="stylesheet" href="spybus.css">
   <script src="punyspy.js"></script>
 </head>
 <body>
-<script>var app = Elm.Main.init();</script>
+<script>
+  const socket = new WebSocket('ws://localhost:9160');
+  var app = Elm.Main.init();
+
+  app.ports.sendWSMessage.subscribe(function(message) {
+    socket.send(message);
+  });
+
+  socket.addEventListener("message", function(event) {
+    app.ports.receiveWSMessage.send(event.data);
+  });
+
+</script>
 </body>
 </html>

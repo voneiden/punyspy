@@ -1,22 +1,32 @@
 port module Main exposing (main)
 
+import Base64.Encode as Encode
+import Base64.Decode as B64Decode
 import Browser
-import Html exposing (Html)
-import Html.Attributes as Html exposing (style)
+import Char exposing (fromCode)
+import Html exposing (Attribute, Html, button, div, h1, input, table, tbody, td, text, th, thead, tr)
+import Html.Attributes exposing (class, classList, id, placeholder, value)
+import Html.Events exposing (onClick, onInput)
+import Html.Keyed as Keyed
 import Http
-import Json.Decode as Decode exposing (Decoder, andThen, int, list, string)
+import Json.Decode as Decode exposing (Decoder, andThen, decodeString, int, list, string)
 import Json.Decode.Pipeline exposing (required)
 import Json.Encode
+import String exposing (fromChar)
 import Task
 import Time
 
+-- TODO TODO TODO!
+-- Message must be parsed into bytes, we cannot expect it to be utf8 string, that's just gonna be a bad day
+
 type alias ConnectionStat =
     { messagesIn : Int
-    , messagesOut: Int
-    , created: Int
-    , ping: Int
-    , sockAddr: String
+    , messagesOut : Int
+    , created : Int
+    , ping : Int
+    , sockAddr : String
     }
+
 
 connectionStatsDecoder : Decoder ConnectionStat
 connectionStatsDecoder =
@@ -27,37 +37,56 @@ connectionStatsDecoder =
         |> required "ping" int
         |> required "sockAddr" string
 
+
 type alias Message =
-    { id : Int
+    { id : String
     , timestamp : Time.Posix
     , topic : List String
     , message : String
     }
 
-type alias StoredMessage =
-    { data : Message
-    , received: Time.Posix
+
+type alias SourceMessage =
+    { timestamp : Time.Posix
+    , topic : List String
+    , message : String
     }
 
 
-storeMessage : Time.Posix -> Message -> StoredMessage
-storeMessage now msg =
-    { data=msg, received=now }
+convertMessage : String -> SourceMessage -> Message
+convertMessage id source =
+    { id = id, timestamp = source.timestamp, topic = source.topic, message = source.message }
 
-messageDecoder : Decoder Message
+
+appendMessage : SourceMessage -> List Message -> List Message
+appendMessage source messages =
+    convertMessage (String.fromInt <| List.length messages) source :: messages
+
+
+b64DecodeDefault : String -> String
+b64DecodeDefault s =
+    case B64Decode.decode B64Decode.string s of
+        Ok ds ->
+            ds
+        Err _ ->
+            "Decode failed"
+
+
+messageDecoder : Decoder SourceMessage
 messageDecoder =
-    Decode.succeed Message
-        |> required "id" int
+    Decode.succeed SourceMessage
         |> required "timestamp" (int |> andThen (\t -> Decode.succeed <| Time.millisToPosix t))
         |> required "topic" (list string)
-        |> required "message" string
+        |> required "message" (string |> andThen (\m -> Decode.succeed <| b64DecodeDefault m))
 
 
 messageEncode : Message -> Json.Encode.Value
 messageEncode message =
-    Json.Encode.object [
-        ("test", Json.Encode.string message.message )
-    ]
+    Json.Encode.object
+        [ ( "test", Json.Encode.string message.message )
+        ]
+
+
 messagesEncode : List Message -> Json.Encode.Value
 messagesEncode messages =
     Json.Encode.list messageEncode messages
@@ -65,156 +94,366 @@ messagesEncode messages =
 
 type alias StatsResponse =
     { connectionStats : List ConnectionStat
-    , messages : List Message
     }
+
 
 statsResponseDecoder : Decoder StatsResponse
 statsResponseDecoder =
     Decode.succeed StatsResponse
         |> required "connectionStats" (list connectionStatsDecoder)
-        |> required "messages" (list messageDecoder)
+
+
 
 --- result : Result String User
-    --result =
-    --    Decode.decodeString
-    --        userDecoder
+--result =
+--    Decode.decodeString
+--        userDecoder
+
 
 type alias Document a =
-  { title : String
-  , body : List (Html a)
-  }
+    { title : String
+    , body : List (Html a)
+    }
+
 
 main =
-  Browser.document { init = init, update = update, view = view, subscriptions = subscriptions }
+    Browser.document { init = init, update = update, view = view, subscriptions = subscriptions }
+
 
 type alias State =
     { stats : StatsResponse
     , time : Time.Posix
+    , zone : Time.Zone
     , messages : List Message
+    , inputDevice : String
+    , inputModule : String
+    , inputAddress : String
     }
 
-type  Model = INIT (Maybe Time.Posix) | READY State | ERROR
+
+type Model
+    = INIT (Maybe StatsResponse) (Maybe Time.Posix) (Maybe Time.Zone) (List Message)
+    | READY State
+    | ERROR
+    | ERROR_DECODE Decode.Error
+
 
 type Msg
-  = GotStats (Result Http.Error StatsResponse)
-  | Tick Time.Posix
+    = GotStats (Result Http.Error StatsResponse)
+    | Tick Time.Posix
+    | Zone Time.Zone
+    | Write
+    | Read
+    | InputDevice String
+    | InputModule String
+    | InputAddress String
+    | CmdSent (Result Http.Error ())
+    | SendWSMessage String
+    | ReceiveWSMessage String
+    | CheckInitReady
 
-init :  () -> (Model, Cmd Msg)
+
+init : () -> ( Model, Cmd Msg )
 init _ =
-  (INIT Nothing, Cmd.batch [getStats 0, getTime])
+    ( INIT Nothing Nothing Nothing [], Cmd.batch [ getStats, getTime, getZone ] )
 
-lastId : List Message -> Int
-lastId messages =
-    case List.head <| List.reverse messages of
-        Just message ->
-            message.id
-        Nothing ->
-            0
 
-update : Msg -> Model -> (Model, Cmd Msg)
+update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
-    case msg of
-        GotStats result ->
-            case result of
-                Ok stats ->
-                    case model of
-                        READY state ->
-                            (READY {state | stats=stats, messages=(state.messages ++ stats.messages)}, Cmd.none)
-                        INIT (Just t) ->
-                            (READY {stats=stats, time=t, messages=stats.messages}, Cmd.none)
-                        _ ->
-                            -- Da fuq
-                            (READY {stats=stats, time=Time.millisToPosix 0, messages=stats.messages}, Cmd.none)
-                Err _ ->
-                    (ERROR, Cmd.none)
+    case model of
+        READY state ->
+            case msg of
+                GotStats result ->
+                    case result of
+                        Ok stats ->
+                            ( READY { state | stats = stats }, Cmd.none )
 
-        Tick t ->
-            case model of
-                READY stats ->
-                    (READY {stats | time=t}, getStats (lastId stats.messages))
-                INIT _ ->
-                    (INIT (Just t), Cmd.none)
+                        Err _ ->
+                            ( ERROR, Cmd.none )
+
+                Tick t ->
+                    ( READY { state | time = t }, getStats )
+
+                Write ->
+                    let
+                        message =
+                            Encode.encode <| Encode.string <| fromChar <| fromCode 0
+                    in
+                    ( model, postPub ("sx/" ++ state.inputDevice ++ "/i/w/" ++ state.inputModule ++ "/" ++ state.inputAddress ++ "/") message )
+
+                Read ->
+                    let
+                        message =
+                            Encode.encode <| Encode.string <| fromChar <| fromCode 1
+                    in
+                    ( model, postPub ("sx/" ++ state.inputDevice ++ "/i/r/" ++ state.inputModule ++ "/" ++ state.inputAddress ++ "/") message )
+
+                InputDevice inputDevice ->
+                    ( READY { state | inputDevice = inputDevice }, Cmd.none )
+
+                InputModule inputModule ->
+                    ( READY { state | inputModule = inputModule }, Cmd.none )
+
+                InputAddress inputAddress ->
+                    ( READY { state | inputAddress = inputAddress }, Cmd.none )
+
+                CmdSent _ ->
+                    ( model, Cmd.none )
+
+                SendWSMessage wsmsg ->
+                    ( model, sendWSMessage wsmsg )
+
+                ReceiveWSMessage wsmsg ->
+                    case decodeString messageDecoder wsmsg of
+                        Ok decodedMessage ->
+                            ( READY { state | messages = appendMessage decodedMessage state.messages }, Cmd.none )
+
+                        Err error ->
+                            ( ERROR_DECODE error, Cmd.none )
+
+                CheckInitReady ->
+                    ( model, Cmd.none )
+
+                Zone zone ->
+                    ( READY { state | zone = zone }, Cmd.none )
+
+        INIT maybeStats maybeTime maybeZone messages ->
+            case msg of
+                GotStats result ->
+                    case result of
+                        Ok stats ->
+                            update CheckInitReady (INIT (Just stats) maybeTime maybeZone messages)
+
+                        Err _ ->
+                            ( ERROR, Cmd.none )
+
+                Tick t ->
+                    update CheckInitReady (INIT maybeStats (Just t) maybeZone messages)
+
+                Zone z ->
+                    update CheckInitReady (INIT maybeStats maybeTime (Just z) messages)
+
+                ReceiveWSMessage wsmsg ->
+                    case decodeString messageDecoder wsmsg of
+                        Ok decodedMessage ->
+                            ( INIT maybeStats maybeTime maybeZone (appendMessage decodedMessage messages), Cmd.none )
+
+                        Err error ->
+                            ( ERROR_DECODE error, Cmd.none )
+
+                CheckInitReady ->
+                    case model of
+                        INIT (Just stats) (Just time) (Just zone) _ ->
+                            ( READY (State stats time zone messages "" "" ""), Cmd.none )
+
+                        _ ->
+                            ( model, Cmd.none )
+
                 _ ->
-                    (model, Cmd.none)
+                    ( model, Cmd.none )
+
+        ERROR ->
+            ( model, Cmd.none )
+
+        ERROR_DECODE _ ->
+            ( model, Cmd.none )
+
 
 uptime : Time.Posix -> Time.Posix -> String
 uptime now t =
     let
-        diff = (Time.posixToMillis now - Time.posixToMillis t) // 1000
+        diff =
+            (Time.posixToMillis now - Time.posixToMillis t) // 1000
     in
-    if diff < 60
-    then String.fromInt diff ++ "s"
+    if diff < 60 then
+        String.fromInt diff ++ "s"
+
+    else if diff < 3600 then
+        String.fromInt (diff // 60) ++ "m " ++ String.fromInt (modBy 60 diff) ++ "s"
+
     else
-        if diff < 3600
-        then
-            String.fromInt (diff // 60) ++ "m " ++ String.fromInt (modBy 60 diff) ++ "s"
-        else
-            String.fromInt (diff // 3600) ++ "h " ++ String.fromInt (modBy 60 <| diff // 3600) ++ "m " ++ String.fromInt (modBy 60 diff) ++ "s"
+        String.fromInt (diff // 3600) ++ "h " ++ String.fromInt (modBy 60 <| diff // 3600) ++ "m " ++ String.fromInt (modBy 60 diff) ++ "s"
+
+
 viewConnectionStat : Time.Posix -> ConnectionStat -> Html Msg
 viewConnectionStat now stat =
-    Html.tr [] [
-        Html.td [] [Html.text stat.sockAddr],
-        Html.td [] [Html.text <| String.fromInt stat.ping],
-        Html.td [] [Html.text <| uptime now <| Time.millisToPosix stat.created],
-        Html.td [] [Html.text <| String.fromInt stat.messagesIn],
-        Html.td [] [Html.text <| String.fromInt stat.messagesOut]
-    ]
+    tr []
+        [ td [] [ text stat.sockAddr ]
+        , td [] [ text <| String.fromInt stat.ping ]
+        , td [] [ text <| uptime now <| Time.millisToPosix stat.created ]
+        , td [] [ text <| String.fromInt stat.messagesIn ]
+        , td [] [ text <| String.fromInt stat.messagesOut ]
+        ]
+
 
 viewConnectionStats : Time.Posix -> List ConnectionStat -> Html Msg
 viewConnectionStats now stats =
-    Html.div [] [
-        Html.h1 [] [Html.text "Active connections"],
-        Html.table [] [
-            Html.thead [] [
-                Html.th [] [Html.text "SockName"],
-                Html.th [] [Html.text "Ping"],
-                Html.th [] [Html.text "Uptime"],
-                Html.th [] [Html.text "Messages in"],
-                Html.th [] [Html.text "Messages out"]
-            ],
-            Html.tbody [] (List.map (viewConnectionStat now) stats)
+    div [ id "stats" ]
+        [ h1 [] [ text "Active connections" ]
+        , table []
+            [ thead []
+                [ th [] [ text "SockName" ]
+                , th [] [ text "Ping" ]
+                , th [] [ text "Uptime" ]
+                , th [] [ text "Messages in" ]
+                , th [] [ text "Messages out" ]
+                ]
+            , tbody [] (List.map (viewConnectionStat now) stats)
+            ]
         ]
-    ]
 
-viewMessage : Message -> Html Msg
-viewMessage message =
-    Html.div [] [Html.text <| (String.join "/" message.topic) ++  message.message]
 
-viewMessages : List Message -> Html Msg
-viewMessages messages =
-    Html.div [] <| [
-        Html.h1 [] [Html.text "Message list"]
-    ] ++ List.map viewMessage messages
+timeToString : Int -> String
+timeToString n =
+    if n < 10 then
+        "0" ++ String.fromInt n
+
+    else
+        String.fromInt n
+
+
+viewMessageTimestamp : Time.Zone -> Time.Posix -> Html Msg
+viewMessageTimestamp zone t =
+    let
+        hour =
+            timeToString <| Time.toHour zone t
+
+        minute =
+            timeToString <| Time.toMinute zone t
+
+        second =
+            timeToString <| Time.toSecond zone t
+
+        milli =
+            timeToString <| Time.toMillis zone t
+    in
+    div [ class "message-timestamp" ] [ text <| hour ++ ":" ++ minute ++ ":" ++ second ++ "." ++ milli ]
+
+
+viewMessageBody : String -> Html Msg
+viewMessageBody message =
+    div [ class "message-body" ] [ text <| String.join " " <| List.map String.fromInt <|List.map Char.toCode <| String.toList message ]
+
+
+viewMessageTopic : List String -> Html Msg
+viewMessageTopic topic =
+    div [ class "message-topic" ] [ text <| String.join "/" topic ]
+
+
+messageSxClass : List String -> Attribute Msg
+messageSxClass topic =
+    case List.head <| List.drop 2 topic of
+        Just "o" ->
+            class "m-output"
+
+        Just "i" ->
+            class "m-input"
+
+        _ ->
+            class "m-unknown"
+
+
+messageClass : Message -> List (Attribute Msg)
+messageClass message =
+    case List.head message.topic of
+        Just "sx" ->
+            [ class "sx", messageSxClass message.topic ]
+
+        _ ->
+            [ class "m-default" ]
+
+
+viewMessage : Time.Zone -> Message -> ( String, Html Msg )
+viewMessage zone message =
+    ( message.id ++ (String.fromInt <| Time.posixToMillis message.timestamp)
+    , div ([ class "message" ] ++ messageClass message)
+        [ viewMessageTimestamp zone message.timestamp
+        , viewMessageTopic message.topic
+        , viewMessageBody message.message
+        ]
+    )
+
+
+viewMessages : State -> Html Msg
+viewMessages state =
+    div [ id "messages" ] <|
+        [ h1 [] [ text "Message list" ]
+        , viewInput state
+        , Keyed.node "div" [ class "messages-container" ] (List.map (viewMessage state.zone) state.messages)
+        ]
+
+
+viewInput : State -> Html Msg
+viewInput state =
+    div []
+        [ input [ placeholder "Device", value state.inputDevice, onInput InputDevice ] []
+        , input [ placeholder "Module", value state.inputModule, onInput InputModule ] []
+        , input [ placeholder "Address", value state.inputAddress, onInput InputAddress ] []
+        , button [ onClick Read ] [ text "Read" ]
+        , button [ onClick Write ] [ text "Write" ]
+        ]
 
 
 view : Model -> Document Msg
-view model = case model of
-    READY state ->
-        {title = "SpyBus 2000", body = [Html.div [] [viewConnectionStats state.time state.stats.connectionStats, viewMessages state.messages ]]}
-    INIT _ ->
-        {title = "SpyBus 2000 - Loading", body = [Html.div [] [Html.text "Booting up, hold on to your pants"] ]}
-    ERROR ->
-        {title = "SpyBus 2000 - Error", body = [Html.div [] [Html.text "Fatal error has occured" ]]}
+view model =
+    case model of
+        INIT _ _ _ _ ->
+            { title = "SpyBus 2000 - Booting up", body = [ div [] [ text "Hold on to your pants" ] ] }
+
+        READY state ->
+            { title = "SpyBus 2000", body = [ div [ id "root" ] [ viewConnectionStats state.time state.stats.connectionStats, viewMessages state ] ] }
+
+        ERROR ->
+            { title = "SpyBus 2000 - Error", body = [ div [] [ text "Fatal error has occured" ] ] }
+
+        ERROR_DECODE error ->
+            { title = "SpyBus 2000 - Error", body = [ div [] [ text <| "Fatal json decode error has occured: " ++ Decode.errorToString error ] ] }
+
+
+port sendWSMessage : String -> Cmd msg
+
+
+port receiveWSMessage : (String -> msg) -> Sub msg
+
 
 subscriptions : Model -> Sub Msg
 subscriptions m =
-    Sub.batch [
-        Time.every 1000 Tick
-    ]
+    Sub.batch
+        [ Time.every 1000 Tick
+        , receiveWSMessage ReceiveWSMessage
+        ]
 
 
--- PORTS
--- check https://ellie-app.com/8yYddD6HRYJa1
-port setStorage : Json.Encode.Value -> Cmd msg
+getStats : Cmd Msg
+getStats =
+    Http.get
+        { url = "http://localhost:18080/stats"
+        , expect = Http.expectJson GotStats statsResponseDecoder
+        }
 
-getStats : Int -> Cmd Msg
-getStats since =
-  Http.get
-    { url = "http://localhost:18080/stats?since=" ++ String.fromInt since
-    , expect = Http.expectJson GotStats statsResponseDecoder
-    }
+
+pubEncode : String -> String -> Json.Encode.Value
+pubEncode pubTopic pubMessage =
+    Json.Encode.object
+        [ ( "pubTopic", Json.Encode.string pubTopic )
+        , ( "pubMessage", Json.Encode.string pubMessage )
+        ]
+
+
+postPub : String -> String -> Cmd Msg
+postPub pubTopic pubMessage =
+    Http.post
+        { url = "http://localhost:18080/cmd"
+        , body = Http.jsonBody (pubEncode pubTopic pubMessage)
+        , expect = Http.expectWhatever CmdSent
+        }
+
 
 getTime : Cmd Msg
 getTime =
     Task.perform Tick Time.now
 
+
+getZone : Cmd Msg
+getZone =
+    Task.perform Zone Time.here

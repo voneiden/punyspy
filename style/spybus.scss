@@ -1,0 +1,34 @@
+#root {
+  display: flex;
+  flex-direction: row;
+}
+
+#stats {
+  flex-basis: 1px;
+  flex-grow: 1;
+}
+#messages {
+  flex-basis: 1px;
+  flex-grow: 1;
+  font-family: monospace;
+
+  .message {
+    display: grid;
+    animation: fade-in 5s ease;
+    grid-template-columns: 110px 200px 1fr;
+    &.sx {
+      background-color: #c3ffb8;
+    }
+  }
+}
+
+
+@keyframes fade-in {
+  0% {
+    background-color: red;
+
+  }
+  100% {
+    background-color: green;
+  }
+}
