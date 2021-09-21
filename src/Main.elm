@@ -225,21 +225,15 @@ init _ =
     ( INIT Nothing Nothing Nothing [] Dict.empty, Cmd.batch [ getStats, getTime, getZone ] )
 
 
-maybeTriple : ( Maybe Int, Maybe Int, Maybe Int ) -> Maybe ( Int, Int, Int )
-maybeTriple maybeints =
-    case maybeints of
-        ( Just i1, Just i2, Just i3 ) ->
-            Just ( i1, i2, i3 )
-
-        _ ->
-            Nothing
-
-
 parseSxTopic : List String -> Maybe ( Int, Int, Int )
 parseSxTopic topic =
     case topic of
         "sx" :: deviceId :: "o" :: moduleId :: address :: _ ->
-            maybeTriple ( String.toInt deviceId, String.toInt moduleId, String.toInt address )
+            case ( String.toInt deviceId, String.toInt moduleId, String.toInt address ) of
+                (Just iDeviceId, Just iModuleId, Just iAddress) ->
+                    Just (iDeviceId, iModuleId, iAddress)
+                _ ->
+                    Nothing
 
         _ ->
             Nothing
@@ -275,17 +269,29 @@ createModules moduleIds =
     Dict.fromList <| List.map (\i -> ( i, Module i defaultModuleInfo )) moduleIds
 
 
+updateModules : List Int -> Dict Int Module -> Dict Int Module
+updateModules moduleIds modules =
+    let
+        old = Dict.filter (\id _ -> List.member id moduleIds) modules
+        --newIds = List.filter (\id -> not <| Dict.member id old) moduleIds
+        new = Dict.fromList <| List.map (\i -> ( i, Module i defaultModuleInfo )) moduleIds
+    in
+    Dict.union old new
+
 updateDeviceModules : Int -> List Int -> Dict Int Device -> Dict Int Device
 updateDeviceModules deviceId moduleIds dict =
     let
         device =
             getDeviceOrDefault deviceId dict
     in
-    Dict.insert deviceId { device | modules = createModules moduleIds } dict
+    Dict.insert deviceId { device | modules = updateModules moduleIds device.modules } dict
 
 
 updateModuleInfo : Int -> Int -> ModuleInfo -> ModuleInfo
 updateModuleInfo address value info =
+    let
+        a = log "Check address: " address
+    in
     case address of
         0xF6 ->
             { info | sigrow1 = value }
@@ -321,32 +327,26 @@ updateModuleInfo address value info =
             info
 
 
-updateDeviceModuleAddress : Int -> Int -> Int -> List Int -> Dict Int Device -> Dict Int Device
-updateDeviceModuleAddress deviceId moduleId address values dict =
-    if address >= 0xF6 && address <= 0xFF then
+recursivelyUpdateModuleInfo : ModuleInfo -> Int -> List Int -> ModuleInfo
+recursivelyUpdateModuleInfo info address values =
+    case values of
+        [] ->
+            info
+        value :: rest ->
+            recursivelyUpdateModuleInfo (updateModuleInfo address value info) (address + 1) rest
+
+updateDeviceModuleAddress : Device -> Module -> Int -> List Int -> Dict Int Device -> Dict Int Device
+updateDeviceModuleAddress device mod address values dict =
         let
-            device =
-                getDeviceOrDefault deviceId dict
+            newMod =
+                { mod | info = recursivelyUpdateModuleInfo mod.info address values }
+            x = log "mod" newMod
 
-            mod =
-                getDeviceModuleOrDefault moduleId device
+            newDevice =
+                { device | modules = Dict.insert mod.id newMod device.modules }
         in
-        case values of
-            [] ->
-                dict
+        Dict.insert device.id newDevice dict
 
-            value :: rest ->
-                let
-                    newMod =
-                        { mod | info = updateModuleInfo address value mod.info }
-
-                    newDevice =
-                        { device | modules = Dict.insert moduleId newMod device.modules }
-                in
-                updateDeviceModuleAddress deviceId moduleId (address + 1) rest (Dict.insert deviceId newDevice dict)
-
-    else
-        dict
 
 
 updateDevices : Message -> Dict Int Device -> Dict Int Device
@@ -359,7 +359,14 @@ updateDevices msg dict =
                         updateDeviceModules deviceId message dict
 
                     else
-                        updateDeviceModuleAddress deviceId moduleId address message dict
+                        let
+                            device =
+                                getDeviceOrDefault deviceId dict
+
+                            mod =
+                                getDeviceModuleOrDefault moduleId device
+                        in
+                        updateDeviceModuleAddress device mod address message dict
 
                 Nothing ->
                     dict
