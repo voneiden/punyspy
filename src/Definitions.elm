@@ -26,6 +26,7 @@ type Name
 type Module
     = MOD_ETH
     | MOD_MAX7219
+    | MOD_IO
     | MOD_UNKNOWN
 
 type MCU
@@ -55,6 +56,13 @@ mcuRam mcu =
         MCU_UNKNOWN -> 0
 
 
+deviceName : Int -> String
+deviceName id =
+    case id of
+        48 ->
+            "MCDU, Captain"
+        _ ->
+            "Unknown device"
 
 moduleName : Module -> String
 moduleName id =
@@ -64,6 +72,9 @@ moduleName id =
 
         MOD_MAX7219 ->
             "MAX7219"
+
+        MOD_IO ->
+            "IO"
 
         MOD_UNKNOWN ->
             "Unknown module"
@@ -77,6 +88,9 @@ moduleTypeFromId id =
 
         0x0A ->
             MOD_MAX7219
+
+        0x0B ->
+            MOD_IO
 
         _ ->
             MOD_UNKNOWN
@@ -115,6 +129,9 @@ moduleRegisters moduleType =
             , Register (Address 0xFE) (Size 1) RW (Name "Debug 3")
             , Register (Address 0xFF) (Size 1) RW (Name "Debug 4")
             ]
+
+        MOD_IO ->
+            []
 
         MOD_UNKNOWN ->
             []

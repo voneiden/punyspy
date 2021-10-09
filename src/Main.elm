@@ -9,10 +9,10 @@ import Bytes.Decode
 import Bytes.Encode as BEncode
 import Char exposing (fromCode)
 import Debug exposing (log)
-import Definitions exposing (mcuName, mcuRam, moduleName, moduleTypeFromId, signatureToMCU)
+import Definitions exposing (deviceName, mcuName, mcuRam, moduleName, moduleTypeFromId, signatureToMCU)
 import Dict exposing (Dict)
 import Hex exposing (fromHex, maybeToHex, toHex)
-import Html exposing (Attribute, Html, button, div, h1, input, li, span, table, tbody, td, text, th, thead, tr, ul)
+import Html exposing (Attribute, Html, button, div, h1, h3, input, li, span, table, tbody, td, text, th, thead, tr, ul)
 import Html.Attributes exposing (class, classList, id, placeholder, value)
 import Html.Events exposing (onClick, onInput)
 import Html.Keyed as Keyed
@@ -27,7 +27,8 @@ import Time
 
 
 -- TODO TODO TODO!
--- Message must be parsed into bytes, we cannot expect it to be utf8 string, that's just gonna be a bad day
+-- message filtering
+-- message mode (sx/sim/freeform)
 
 
 type alias ConnectionStat =
@@ -128,7 +129,10 @@ statsResponseDecoder =
 
 
 type alias ModuleInfo =
-    { sigrow1 : Int
+    { moduleId : Int
+
+    -- Registry values
+    , sigrow1 : Int
     , sigrow2 : Int
     , sigrow3 : Int
     , stackH : Int
@@ -142,9 +146,10 @@ type alias ModuleInfo =
     }
 
 
-defaultModuleInfo : ModuleInfo
-defaultModuleInfo =
-    { sigrow1 = 0
+defaultModuleInfo : Int -> ModuleInfo
+defaultModuleInfo moduleId =
+    { moduleId = moduleId
+    , sigrow1 = 0
     , sigrow2 = 0
     , sigrow3 = 0
     , stackH = 0
@@ -159,7 +164,7 @@ defaultModuleInfo =
 
 
 type alias Module =
-    { id : Int
+    { twiAddress : Int
     , info : ModuleInfo
     }
 
@@ -230,8 +235,9 @@ parseSxTopic topic =
     case topic of
         "sx" :: deviceId :: "o" :: moduleId :: address :: _ ->
             case ( String.toInt deviceId, String.toInt moduleId, String.toInt address ) of
-                (Just iDeviceId, Just iModuleId, Just iAddress) ->
-                    Just (iDeviceId, iModuleId, iAddress)
+                ( Just iDeviceId, Just iModuleId, Just iAddress ) ->
+                    Just ( iDeviceId, iModuleId, iAddress )
+
                 _ ->
                     Nothing
 
@@ -245,13 +251,13 @@ parseSxTopic topic =
 
 
 getDeviceModuleOrDefault : Int -> Device -> Module
-getDeviceModuleOrDefault moduleId device =
-    case Dict.get moduleId device.modules of
+getDeviceModuleOrDefault twiAddress device =
+    case Dict.get twiAddress device.modules of
         Just mod ->
             mod
 
         Nothing ->
-            Module moduleId defaultModuleInfo
+            Module twiAddress (defaultModuleInfo -1)
 
 
 getDeviceOrDefault : Int -> Dict Int Device -> Device
@@ -264,34 +270,41 @@ getDeviceOrDefault deviceId dict =
             Device deviceId Dict.empty
 
 
-createModules : List Int -> Dict Int Module
-createModules moduleIds =
-    Dict.fromList <| List.map (\i -> ( i, Module i defaultModuleInfo )) moduleIds
+updateModules : List ( Int, Int ) -> Dict Int Module
+updateModules moduleInfoPairs =
+    Dict.fromList <|
+        List.map
+            (\( twiAddr, moduleId ) ->
+                ( twiAddr
+                , Module twiAddr (defaultModuleInfo moduleId)
+                )
+            )
+            moduleInfoPairs
 
 
-updateModules : List Int -> Dict Int Module -> Dict Int Module
-updateModules moduleIds modules =
-    let
-        old = Dict.filter (\id _ -> List.member id moduleIds) modules
-        --newIds = List.filter (\id -> not <| Dict.member id old) moduleIds
-        new = Dict.fromList <| List.map (\i -> ( i, Module i defaultModuleInfo )) moduleIds
-    in
-    Dict.union old new
+
+
+pairInts : List Int -> List ( Int, Int )
+pairInts ints =
+    case ints of
+        a :: b :: rest ->
+            ( a, b ) :: pairInts rest
+
+        _ ->
+            []
+
 
 updateDeviceModules : Int -> List Int -> Dict Int Device -> Dict Int Device
-updateDeviceModules deviceId moduleIds dict =
+updateDeviceModules deviceId moduleInfoStream dict =
     let
         device =
             getDeviceOrDefault deviceId dict
     in
-    Dict.insert deviceId { device | modules = updateModules moduleIds device.modules } dict
+    Dict.insert deviceId { device | modules = updateModules (pairInts moduleInfoStream) } dict
 
 
 updateModuleInfo : Int -> Int -> ModuleInfo -> ModuleInfo
 updateModuleInfo address value info =
-    let
-        a = log "Check address: " address
-    in
     case address of
         0xF6 ->
             { info | sigrow1 = value }
@@ -332,21 +345,21 @@ recursivelyUpdateModuleInfo info address values =
     case values of
         [] ->
             info
+
         value :: rest ->
             recursivelyUpdateModuleInfo (updateModuleInfo address value info) (address + 1) rest
 
+
 updateDeviceModuleAddress : Device -> Module -> Int -> List Int -> Dict Int Device -> Dict Int Device
 updateDeviceModuleAddress device mod address values dict =
-        let
-            newMod =
-                { mod | info = recursivelyUpdateModuleInfo mod.info address values }
-            x = log "mod" newMod
+    let
+        newMod =
+            { mod | info = recursivelyUpdateModuleInfo mod.info address values }
 
-            newDevice =
-                { device | modules = Dict.insert mod.id newMod device.modules }
-        in
-        Dict.insert device.id newDevice dict
-
+        newDevice =
+            { device | modules = Dict.insert mod.twiAddress newMod device.modules }
+    in
+    Dict.insert device.id newDevice dict
 
 
 updateDevices : Message -> Dict Int Device -> Dict Int Device
@@ -354,8 +367,8 @@ updateDevices msg dict =
     case msg.message of
         Just message ->
             case parseSxTopic msg.topic of
-                Just ( deviceId, moduleId, address ) ->
-                    if moduleId == 0x01 && address == 0x01 then
+                Just ( deviceId, twiAddress, regAddress ) ->
+                    if twiAddress == 0x01 && regAddress == 0x01 then
                         updateDeviceModules deviceId message dict
 
                     else
@@ -364,9 +377,9 @@ updateDevices msg dict =
                                 getDeviceOrDefault deviceId dict
 
                             mod =
-                                getDeviceModuleOrDefault moduleId device
+                                getDeviceModuleOrDefault twiAddress device
                         in
-                        updateDeviceModuleAddress device mod address message dict
+                        updateDeviceModuleAddress device mod regAddress message dict
 
                 Nothing ->
                     dict
@@ -384,12 +397,21 @@ processReceivedWSMessage messages devices wsmsg =
                     convertMessage (String.fromInt <| List.length messages) decodedMessage
 
                 newMessages =
-                    messages ++ [ newMessage ]
+                    newMessage :: messages
             in
             Ok ( newMessages, updateDevices newMessage devices )
 
         Err error ->
             Err error
+
+
+requestAddressRead : Int -> Int -> Int -> Int -> Cmd Msg
+requestAddressRead deviceId moduleId address length =
+    let
+        message =
+            B64Encode.encode <| B64Encode.string <| fromChar <| fromCode length
+    in
+    postPub ("sx/" ++ String.fromInt deviceId ++ "/i/r/" ++ String.fromInt moduleId ++ "/" ++ String.fromInt address ++ "/") message
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -424,7 +446,7 @@ update msg model =
                 Read ->
                     let
                         message =
-                            B64Encode.encode <| B64Encode.string <| fromChar <| fromCode 10
+                            B64Encode.encode <| B64Encode.string <| fromChar <| fromCode 1
                     in
                     ( model, postPub ("sx/" ++ state.inputDevice ++ "/i/r/" ++ state.inputModule ++ "/" ++ state.inputAddress ++ "/") message )
 
@@ -572,10 +594,10 @@ viewDeviceModule : Module -> Html Msg
 viewDeviceModule deviceModule =
     let
         sModuleId =
-            String.fromInt deviceModule.id
+            String.fromInt deviceModule.twiAddress
 
         name =
-            moduleName <| moduleTypeFromId deviceModule.id
+            moduleName <| moduleTypeFromId deviceModule.info.moduleId
     in
     li [ onClick (InputModule sModuleId) ] [ span [] [ text name ], viewModuleInfo deviceModule.info ]
 
@@ -592,7 +614,7 @@ viewDeviceInformation ( _, device ) =
             String.fromInt device.id
     in
     div [ class "device" ]
-        [ span [ onClick (InputDevice sDeviceId) ] [ text sDeviceId ]
+        [ h3 [ onClick (InputDevice sDeviceId) ] [ text <| deviceName device.id ++ " (" ++ sDeviceId ++ ")" ]
         , viewDeviceModules <| Dict.values device.modules
         ]
 
@@ -692,7 +714,7 @@ viewMessages state =
             , div [] [ text "Topic" ]
             , div [] [ text "Message" ]
             ]
-        , Keyed.node "div" [ class "messages-container" ] (List.map (viewMessage state.zone) state.messages)
+        , Keyed.node "div" [ class "messages-container" ] (List.map (viewMessage state.zone) (List.take 100 state.messages))
         ]
 
 
