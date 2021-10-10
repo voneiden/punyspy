@@ -1,7 +1,5 @@
 module Hex exposing (fromHex, toHex, maybeToHex)
 
-import Debug exposing (log)
-
 
 hexify : Int -> String
 hexify i =
@@ -52,10 +50,6 @@ pairsToInts s =
 
 fromHex : String -> Maybe (List Int)
 fromHex s =
-    let
-        x =
-            log "1) " (String.toList <| String.replace " " "" s)
-    in
     pairsToInts <| String.toList <| String.replace " " "" s
 
 
