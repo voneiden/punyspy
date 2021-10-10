@@ -29,31 +29,50 @@ type Module
     | MOD_IO
     | MOD_UNKNOWN
 
+
 type MCU
     = MCU_ATTINY814
     | MCU_ATTINY414
     | MCU_UNKNOWN
 
+
 mcuName : MCU -> String
 mcuName mcu =
     case mcu of
-        MCU_ATTINY814 -> "ATtiny814"
-        MCU_ATTINY414 -> "ATtiny414"
-        MCU_UNKNOWN -> "Unknown"
+        MCU_ATTINY814 ->
+            "ATtiny814"
 
-signatureToMCU : (Int, Int, Int) -> MCU
+        MCU_ATTINY414 ->
+            "ATtiny414"
+
+        MCU_UNKNOWN ->
+            "Unknown"
+
+
+signatureToMCU : ( Int, Int, Int ) -> MCU
 signatureToMCU signature =
     case signature of
-        (0x1E, 0x93, 0x22) -> MCU_ATTINY814
-        (0x1E, 0x92, 0x22) -> MCU_ATTINY414
-        _ -> MCU_UNKNOWN
+        ( 0x1E, 0x93, 0x22 ) ->
+            MCU_ATTINY814
+
+        ( 0x1E, 0x92, 0x22 ) ->
+            MCU_ATTINY414
+
+        _ ->
+            MCU_UNKNOWN
+
 
 mcuRam : MCU -> Int
 mcuRam mcu =
     case mcu of
-        MCU_ATTINY814 -> 512
-        MCU_ATTINY414 -> 256
-        MCU_UNKNOWN -> 0
+        MCU_ATTINY814 ->
+            512
+
+        MCU_ATTINY414 ->
+            256
+
+        MCU_UNKNOWN ->
+            0
 
 
 deviceName : Int -> String
@@ -61,8 +80,10 @@ deviceName id =
     case id of
         48 ->
             "MCDU, Captain"
+
         _ ->
             "Unknown device"
+
 
 moduleName : Module -> String
 moduleName id =
@@ -96,9 +117,13 @@ moduleTypeFromId id =
             MOD_UNKNOWN
 
 
-type DeviceId = DeviceId Int
+type DeviceId
+    = DeviceId Int
+
+
 type Device
     = Device DeviceId (List Module)
+
 
 moduleRegisters : Module -> List Register
 moduleRegisters moduleType =

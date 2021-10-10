@@ -1,4 +1,4 @@
-module Hex exposing (fromHex, toHex, maybeToHex)
+module Hex exposing (fromHex, maybeToHex, toHex)
 
 
 hexify : Int -> String
@@ -9,6 +9,7 @@ hexify i =
 toHex : List Int -> String
 toHex values =
     String.join " " <| List.map hexify values
+
 
 maybeToHex : Maybe (List Int) -> String
 maybeToHex maybeValues =

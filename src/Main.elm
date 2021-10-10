@@ -1,6 +1,5 @@
 port module Main exposing (main)
 
-import Array
 import Base64.Decode as B64Decode
 import Base64.Encode as B64Encode
 import Browser
@@ -8,12 +7,11 @@ import Bytes exposing (Bytes)
 import Bytes.Decode
 import Bytes.Encode as BEncode
 import Char exposing (fromCode)
-import Debug exposing (log)
 import Definitions exposing (deviceName, mcuName, mcuRam, moduleName, moduleTypeFromId, signatureToMCU)
 import Dict exposing (Dict)
 import Hex exposing (fromHex, maybeToHex, toHex)
 import Html exposing (Attribute, Html, button, div, h1, h3, input, li, span, table, tbody, td, text, th, thead, tr, ul)
-import Html.Attributes exposing (class, classList, id, placeholder, value)
+import Html.Attributes exposing (class, id, placeholder, value)
 import Html.Events exposing (onClick, onInput)
 import Html.Keyed as Keyed
 import Http
@@ -431,15 +429,13 @@ processReceivedWSMessage scan messages devices wsmsg =
 
                 historyEndCmd =
                     case decodedMessage.topic of
-                        ["_meta", "history", "end", ""] ->
+                        [ "_meta", "history", "end", "" ] ->
                             Task.perform EndHistory (Task.succeed ())
+
                         _ ->
                             Cmd.none
-
             in
-
-            Ok ( newMessages, updatedDevices, Cmd.batch [cmd, historyEndCmd] )
-
+            Ok ( newMessages, updatedDevices, Cmd.batch [ cmd, historyEndCmd ] )
 
         Err error ->
             Err error
@@ -528,7 +524,7 @@ update msg model =
                     ( model, Cmd.none )
 
                 EndHistory () ->
-                    ( model, Cmd.none)
+                    ( model, Cmd.none )
 
         INIT maybeStats maybeTime maybeZone messages devices historyEnd ->
             case msg of
@@ -561,8 +557,10 @@ update msg model =
 
                         _ ->
                             ( model, Cmd.none )
+
                 EndHistory () ->
                     update CheckInitReady (INIT maybeStats maybeTime maybeZone messages devices True)
+
                 _ ->
                     ( model, Cmd.none )
 
