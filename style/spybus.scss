@@ -1,3 +1,8 @@
+body {
+  background-color: #222222;
+  color: #0abff1;
+  // color: #3598b7;
+}
 #root {
   display: flex;
   flex-direction: row;
@@ -37,10 +42,10 @@
 
 @keyframes fade-in {
   0% {
-    background-color: #8fff8b;
+    background-color: #005272;
 
   }
   100% {
-    background-color: #ffffff;
+    background-color: #222222;
   }
 }

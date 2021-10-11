@@ -11,7 +11,7 @@ import Definitions exposing (deviceName, mcuName, mcuRam, moduleName, moduleType
 import Dict exposing (Dict)
 import Hex exposing (fromHex, maybeToHex, toHex)
 import Html exposing (Attribute, Html, button, div, h1, h3, input, li, span, table, tbody, td, text, th, thead, tr, ul)
-import Html.Attributes exposing (class, id, placeholder, value)
+import Html.Attributes exposing (class, disabled, id, placeholder, value)
 import Html.Events exposing (onClick, onInput)
 import Html.Keyed as Keyed
 import Http
@@ -57,14 +57,6 @@ type alias Message =
     }
 
 
-messageDecoder : Decoder SourceMessage
-messageDecoder =
-    Decode.succeed SourceMessage
-        |> required "timestamp" (int |> andThen (\t -> Decode.succeed <| Time.millisToPosix t))
-        |> required "topic" (list string)
-        |> required "message" (string |> andThen (\m -> Decode.succeed <| b64DecodeDefault m))
-
-
 type alias SourceMessage =
     { timestamp : Time.Posix
     , topic : List String
@@ -72,19 +64,17 @@ type alias SourceMessage =
     }
 
 
+sourceMessageDecoder : Decoder SourceMessage
+sourceMessageDecoder =
+    Decode.succeed SourceMessage
+        |> required "timestamp" (int |> andThen (\t -> Decode.succeed <| Time.millisToPosix t))
+        |> required "topic" (list string)
+        |> required "message" (string |> andThen (\m -> Decode.succeed <| b64DecodeDefault m))
+
+
 convertMessage : String -> SourceMessage -> Message
 convertMessage id source =
     { id = id, timestamp = source.timestamp, topic = source.topic, message = source.message }
-
-
-appendMessage : SourceMessage -> List Message -> List Message
-appendMessage source messages =
-    messages ++ [ convertMessage (String.fromInt <| List.length messages) source ]
-
-
-
---source :: messages
---convertMessage (String.fromInt <| List.length messages) source :: messages
 
 
 decodeBytesTolist : Int -> Bytes.Decode.Decoder a -> Bytes.Decode.Decoder (List a)
@@ -106,6 +96,8 @@ encodeListToBytes intBytes =
     BEncode.encode <| BEncode.sequence <| List.map BEncode.unsignedInt8 intBytes
 
 
+{-| Decode a string into maybe list ints. Returns Nothing if decode fails
+-}
 b64DecodeDefault : String -> Maybe (List Int)
 b64DecodeDefault s =
     case B64Decode.decode B64Decode.bytes s of
@@ -180,8 +172,33 @@ type alias Document a =
     }
 
 
+
+-- MAIN and STATE
+
+
 main =
     Browser.document { init = init, update = update, view = view, subscriptions = subscriptions }
+
+
+type alias InputSXFields =
+    { inputDevice : String
+    , inputModule : String
+    , inputAddress : String
+    , inputData : String
+    }
+
+
+type alias InputFreeFields =
+    { inputTopic : String
+    , inputData : String
+    }
+
+
+{-| Keep the other field type data always along so we can restore it when mode is switched
+-}
+type MessageInput
+    = InputSX InputSXFields InputFreeFields
+    | InputFree InputFreeFields InputSXFields
 
 
 type alias State =
@@ -190,15 +207,8 @@ type alias State =
     , zone : Time.Zone
     , messages : List Message
     , devices : Dict Int Device
-    , inputDevice : String
-    , inputModule : String
-    , inputAddress : String
-    , inputData : String
+    , messageInput : MessageInput
     }
-
-
-
--- TODO improve state
 
 
 type Model
@@ -212,8 +222,8 @@ type Msg
     = GotStats (Result Http.Error StatsResponse)
     | Tick Time.Posix
     | Zone Time.Zone
-    | Write
-    | Read
+    | Write String (Maybe String)
+    | ReadSX (Maybe String) String
     | InputDevice String
     | InputModule String
     | InputAddress String
@@ -231,19 +241,8 @@ init _ =
     ( INIT Nothing Nothing Nothing [] Dict.empty False, Cmd.batch [ getStats, getTime, getZone ] )
 
 
-scanDevice : Device -> Cmd Msg
-scanDevice device =
-    -- 246 = VREG_SIGROW_1
-    Cmd.batch <| List.map (\m -> requestAddressRead device.id m.twiAddress 246 9) (Dict.values device.modules)
 
-
-
-{- Scans device modules for runtime information (memory, errors, mcu, debug..) -}
-
-
-scanDeviceModules : List Device -> Cmd Msg
-scanDeviceModules devices =
-    Cmd.batch <| List.map (\d -> scanDevice d) devices
+-- UPDATE
 
 
 parseSxTopic : List String -> Maybe ( Int, Int, Int )
@@ -259,11 +258,6 @@ parseSxTopic topic =
 
         _ ->
             Nothing
-
-
-
--- add device
--- update devicemodule error/debug/stack
 
 
 getDeviceModuleOrDefault : Int -> Device -> Module
@@ -376,8 +370,8 @@ updateDeviceModuleAddress device mod address values dict =
     Dict.insert device.id newDevice dict
 
 
-updateDevices : Bool -> Message -> Dict Int Device -> ( Dict Int Device, Cmd Msg )
-updateDevices scan msg dict =
+updateDevices : Maybe StatsResponse -> Message -> Dict Int Device -> ( Dict Int Device, Cmd Msg )
+updateDevices maybeStats msg dict =
     case msg.message of
         Just message ->
             case parseSxTopic msg.topic of
@@ -388,11 +382,12 @@ updateDevices scan msg dict =
                                 updateDeviceModules deviceId message dict
 
                             scanCmd =
-                                if scan then
-                                    scanDeviceModules (Dict.values newDevices)
+                                case maybeStats of
+                                    Just stats ->
+                                        scanDeviceModules stats (Dict.values newDevices)
 
-                                else
-                                    Cmd.none
+                                    Nothing ->
+                                        Cmd.none
                         in
                         ( newDevices, scanCmd )
 
@@ -413,9 +408,9 @@ updateDevices scan msg dict =
             ( dict, Cmd.none )
 
 
-processReceivedWSMessage : Bool -> List Message -> Dict Int Device -> String -> Result Decode.Error ( List Message, Dict Int Device, Cmd Msg )
-processReceivedWSMessage scan messages devices wsmsg =
-    case decodeString messageDecoder wsmsg of
+processReceivedWSMessage : Maybe StatsResponse -> List Message -> Dict Int Device -> String -> Result Decode.Error ( List Message, Dict Int Device, Cmd Msg )
+processReceivedWSMessage stats messages devices wsmsg =
+    case decodeString sourceMessageDecoder wsmsg of
         Ok decodedMessage ->
             let
                 newMessage =
@@ -425,7 +420,7 @@ processReceivedWSMessage scan messages devices wsmsg =
                     newMessage :: messages
 
                 ( updatedDevices, cmd ) =
-                    updateDevices scan newMessage devices
+                    updateDevices stats newMessage devices
 
                 historyEndCmd =
                     case decodedMessage.topic of
@@ -441,14 +436,18 @@ processReceivedWSMessage scan messages devices wsmsg =
             Err error
 
 
+readMessageLength : Int -> String
+readMessageLength length =
+    B64Encode.encode <| B64Encode.string <| fromChar <| fromCode length
+
+toSXTopic : Int -> Int -> Int -> String
+toSXTopic deviceId moduleId address =
+    "sx/" ++ String.fromInt deviceId ++ "/i/r/" ++ String.fromInt moduleId ++ "/" ++ String.fromInt address ++ "/"
+
+
 requestAddressRead : Int -> Int -> Int -> Int -> Cmd Msg
 requestAddressRead deviceId moduleId address length =
-    let
-        message =
-            B64Encode.encode <| B64Encode.string <| fromChar <| fromCode length
-    in
-    postPub ("sx/" ++ String.fromInt deviceId ++ "/i/r/" ++ String.fromInt moduleId ++ "/" ++ String.fromInt address ++ "/") message
-
+    postPub (toSXTopic deviceId moduleId address) (readMessageLength length)
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
@@ -466,39 +465,49 @@ update msg model =
                 Tick t ->
                     ( READY { state | time = t }, getStats )
 
-                Write ->
-                    let
-                        message =
-                            fromHex state.inputData
-                                |> Maybe.andThen (\x -> Just <| B64Encode.encode <| B64Encode.bytes <| encodeListToBytes x)
-                    in
+                Write topic message ->
                     case message of
                         Just b64message ->
-                            ( model, postPub ("sx/" ++ state.inputDevice ++ "/i/w/" ++ state.inputModule ++ "/" ++ state.inputAddress ++ "/") b64message )
+                            ( model, postPub topic b64message )
 
                         Nothing ->
                             ( model, Cmd.none )
 
-                Read ->
-                    case ( String.toInt state.inputDevice, String.toInt state.inputModule, String.toInt state.inputAddress ) of
-                        ( Just deviceId, Just moduleId, Just address ) ->
-                            ( model, requestAddressRead deviceId moduleId address 1 )
+                ReadSX maybeTopic message ->
+                    case maybeTopic of
+                        Just topic ->
+                            ( model, postPub topic message )
+                        Nothing ->
+                            ( model, Cmd.none)
 
-                        _ ->
-                            -- TODO show error
-                            ( model, Cmd.none )
 
                 InputDevice inputDevice ->
-                    ( READY { state | inputDevice = inputDevice }, Cmd.none )
+                    case state.messageInput of
+                        InputSX fields other ->
+                            ( READY { state | messageInput = InputSX {fields | inputDevice = inputDevice} other }, Cmd.none )
+                        _ ->
+                            ( model, Cmd.none)
 
                 InputModule inputModule ->
-                    ( READY { state | inputModule = inputModule }, Cmd.none )
+                    case state.messageInput of
+                        InputSX fields other ->
+                            ( READY { state | messageInput = InputSX {fields | inputModule = inputModule} other }, Cmd.none )
+                        _ ->
+                            ( model, Cmd.none)
 
                 InputAddress inputAddress ->
-                    ( READY { state | inputAddress = inputAddress }, Cmd.none )
+                    case state.messageInput of
+                        InputSX fields other ->
+                            ( READY { state | messageInput = InputSX {fields | inputAddress = inputAddress} other }, Cmd.none )
+                        _ ->
+                            ( model, Cmd.none)
 
                 InputData inputData ->
-                    ( READY { state | inputData = inputData }, Cmd.none )
+                    case state.messageInput of
+                        InputSX fields other ->
+                            ( READY { state | messageInput = InputSX {fields | inputData = inputData} other }, Cmd.none )
+                        _ ->
+                            ( model, Cmd.none)
 
                 CmdSent _ ->
                     ( model, Cmd.none )
@@ -507,7 +516,7 @@ update msg model =
                     ( model, sendWSMessage wsmsg )
 
                 ReceiveWSMessage wsmsg ->
-                    case processReceivedWSMessage True state.messages state.devices wsmsg of
+                    case processReceivedWSMessage (Just state.stats) state.messages state.devices wsmsg of
                         Ok ( messages, devices, cmd ) ->
                             ( READY { state | messages = messages, devices = devices }, cmd )
 
@@ -543,7 +552,7 @@ update msg model =
                     update CheckInitReady (INIT maybeStats maybeTime (Just z) messages devices historyEnd)
 
                 ReceiveWSMessage wsmsg ->
-                    case processReceivedWSMessage False messages devices wsmsg of
+                    case processReceivedWSMessage Nothing messages devices wsmsg of
                         Ok ( newMessages, newDevices, cmd ) ->
                             ( INIT maybeStats maybeTime maybeZone newMessages newDevices historyEnd, cmd )
 
@@ -553,7 +562,7 @@ update msg model =
                 CheckInitReady ->
                     case model of
                         INIT (Just stats) (Just time) (Just zone) _ _ True ->
-                            ( READY (State stats time zone messages devices "" "" "" ""), scanDeviceModules (Dict.values devices) )
+                            ( READY (State stats time zone messages devices (InputSX (InputSXFields "" "" "" "") (InputFreeFields "" ""))), scanDeviceModules stats (Dict.values devices) )
 
                         _ ->
                             ( model, Cmd.none )
@@ -569,6 +578,10 @@ update msg model =
 
         ERROR_DECODE _ ->
             ( model, Cmd.none )
+
+
+
+-- VIEWS
 
 
 uptime : Time.Posix -> Time.Posix -> String
@@ -669,9 +682,9 @@ isSockAddrDeviceId sockAddr deviceId =
             False
 
 
-isConnectedDevice : Int -> State -> Bool
-isConnectedDevice deviceId state =
-    List.length (List.filter (\s -> isSockAddrDeviceId s.sockAddr deviceId) state.stats.connectionStats) > 0
+isConnectedDevice : Int -> StatsResponse -> Bool
+isConnectedDevice deviceId stats =
+    List.length (List.filter (\s -> isSockAddrDeviceId s.sockAddr deviceId) stats.connectionStats) > 0
 
 
 viewDeviceInformation : State -> ( Int, Device ) -> Html Msg
@@ -681,7 +694,7 @@ viewDeviceInformation state ( _, device ) =
             String.fromInt device.id
 
         offlineText =
-            if isConnectedDevice device.id state then
+            if isConnectedDevice device.id state.stats then
                 ""
 
             else
@@ -794,14 +807,36 @@ viewMessages state =
 
 viewInput : State -> Html Msg
 viewInput state =
-    div []
-        [ input [ placeholder "Device", value state.inputDevice, onInput InputDevice ] []
-        , input [ placeholder "Module", value state.inputModule, onInput InputModule ] []
-        , input [ placeholder "Address", value state.inputAddress, onInput InputAddress ] []
-        , input [ placeholder "Data", value state.inputData, onInput InputData ] []
-        , button [ onClick Read ] [ text "Read" ]
-        , button [ onClick Write ] [ text "Write" ]
-        ]
+    let
+        inputs =
+            case state.messageInput of
+                InputSX fields _ ->
+                    let
+                        writeTopic = ("sx/" ++ fields.inputDevice ++ "/i/w/" ++ fields.inputModule ++ "/" ++ fields.inputAddress ++ "/")
+                        writeMessage = fromHex fields.inputData |> Maybe.andThen (\x -> Just <| B64Encode.encode <| B64Encode.bytes <| encodeListToBytes x)
+                        readTopic =
+                            case ( String.toInt fields.inputDevice, String.toInt fields.inputModule, String.toInt fields.inputAddress ) of
+                                ( Just deviceId, Just moduleId, Just address ) ->
+                                    Just <| toSXTopic deviceId moduleId address
+                                _ ->
+                                    Nothing
+
+                        readMessage = readMessageLength 1
+                    in
+                    [ input [ placeholder "Device", value fields.inputDevice, onInput InputDevice ] []
+                    , input [ placeholder "Module", value fields.inputModule, onInput InputModule ] []
+                    , input [ placeholder "Address", value fields.inputAddress, onInput InputAddress ] []
+                    , input [ placeholder "Data", value fields.inputData, onInput InputData ] []
+                    , button [ onClick (ReadSX readTopic readMessage), disabled (readTopic == Nothing) ] [ text "Read" ]
+                    , button [ onClick (Write writeTopic writeMessage), disabled (writeMessage == Nothing)] [ text "Write" ]
+                    ]
+                InputFree fields _ ->
+                    [ input [ placeholder "Topic", value fields.inputTopic, onInput InputDevice ] []
+                    , input [ placeholder "Data", value fields.inputData, onInput InputData ] []
+                    ]
+    in
+    div [] inputs
+
 
 
 view : Model -> Document Msg
@@ -838,10 +873,18 @@ view model =
             { title = "SpyBus 2000 - Error", body = [ div [] [ text <| "Fatal json decode error has occured: " ++ Decode.errorToString error ] ] }
 
 
+
+-- PORTS
+
+
 port sendWSMessage : String -> Cmd msg
 
 
 port receiveWSMessage : (String -> msg) -> Sub msg
+
+
+
+-- SUBSCRIPTIONS
 
 
 subscriptions : Model -> Sub Msg
@@ -852,20 +895,16 @@ subscriptions m =
         ]
 
 
+
+-- COMMANDS
+
+
 getStats : Cmd Msg
 getStats =
     Http.get
         { url = "http://localhost:18080/stats"
         , expect = Http.expectJson GotStats statsResponseDecoder
         }
-
-
-pubEncode : String -> String -> Json.Encode.Value
-pubEncode pubTopic pubMessage =
-    Json.Encode.object
-        [ ( "pubTopic", Json.Encode.string pubTopic )
-        , ( "pubMessage", Json.Encode.string pubMessage )
-        ]
 
 
 postPub : String -> String -> Cmd Msg
@@ -877,6 +916,14 @@ postPub pubTopic pubMessage =
         }
 
 
+pubEncode : String -> String -> Json.Encode.Value
+pubEncode pubTopic pubMessage =
+    Json.Encode.object
+        [ ( "pubTopic", Json.Encode.string pubTopic )
+        , ( "pubMessage", Json.Encode.string pubMessage )
+        ]
+
+
 getTime : Cmd Msg
 getTime =
     Task.perform Tick Time.now
@@ -885,3 +932,22 @@ getTime =
 getZone : Cmd Msg
 getZone =
     Task.perform Zone Time.here
+
+
+scanDevice : StatsResponse -> Device -> Cmd Msg
+scanDevice stats device =
+    -- 246 = VREG_SIGROW_1
+    -- isConnectedDevice device.id state
+    if isConnectedDevice device.id stats
+    then
+        Dict.values device.modules
+        |> List.map (\m -> requestAddressRead device.id m.twiAddress 246 9)
+        |> Cmd.batch
+    else Cmd.none
+
+
+{-| Scans device modules for runtime information (memory, errors, mcu, debug..)
+-}
+scanDeviceModules : StatsResponse -> List Device -> Cmd Msg
+scanDeviceModules stats devices =
+    Cmd.batch <| List.map (\d -> scanDevice stats d) devices
