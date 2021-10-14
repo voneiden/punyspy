@@ -9,13 +9,27 @@
 <body>
 <script>
   const socket = new WebSocket('ws://localhost:9160');
-  var app = Elm.Main.init();
+  let timer = null;
+
+  var app = Elm.Main.init({
+    flags: {
+      time: new Date().getTime(),
+      zone: new Date().getTimezoneOffset() * -1,
+  }});
+
+  socket.addEventListener('open', () => {
+    app.ports.openWS.send(null);
+  });
+
+  // TODO autoreconnect when you're not lazy
 
   app.ports.sendWSMessage.subscribe(function(message) {
-    socket.send(message);
+    console.log("MESSAGE IS", message)
+    socket.send(JSON.stringify(message));
   });
 
   socket.addEventListener("message", function(event) {
+    console.log("EVENT", event)
     app.ports.receiveWSMessage.send(event.data);
   });
 

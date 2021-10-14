@@ -39,6 +39,13 @@ body {
   }
 }
 
+.link {
+  text-decoration: underline;
+  cursor: pointer;
+  &:active {
+    color: #0032ff;
+  }
+}
 
 @keyframes fade-in {
   0% {

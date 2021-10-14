@@ -57,10 +57,21 @@ type alias Message =
     }
 
 
+
+-- @DEPRECATED
+
+
 type alias SourceMessage =
     { timestamp : Time.Posix
     , topic : List String
     , message : Maybe (List Int)
+    }
+
+
+type alias RawMessage =
+    { timestamp : Int
+    , topic : List String
+    , message : String
     }
 
 
@@ -70,6 +81,34 @@ sourceMessageDecoder =
         |> required "timestamp" (int |> andThen (\t -> Decode.succeed <| Time.millisToPosix t))
         |> required "topic" (list string)
         |> required "message" (string |> andThen (\m -> Decode.succeed <| b64DecodeDefault m))
+
+
+sourceMessageEncoder : SourceMessage -> Json.Encode.Value
+sourceMessageEncoder sourceMessage =
+    Json.Encode.object
+        [ ( "timestamp", Json.Encode.int <| Time.posixToMillis sourceMessage.timestamp )
+        , ( "topic", Json.Encode.list Json.Encode.string sourceMessage.topic )
+        , ( "message", Json.Encode.string <| "" ) -- B64Encode.encode <| B64Encode.string  sourceMessage.message
+        ]
+
+
+topicDecoder : Decoder (List String)
+topicDecoder =
+    Decode.succeed identity
+        |> required "topic" (list string)
+
+
+rawMessageDecoder : Decoder RawMessage
+rawMessageDecoder =
+    Decode.succeed RawMessage
+        |> required "timestamp" int
+        |> required "topic" (list string)
+        |> required "message" string
+
+
+convertRawMessageToMessage : String -> RawMessage -> Message
+convertRawMessageToMessage id rawMessage =
+    { id = id, timestamp = Time.millisToPosix rawMessage.timestamp, topic = rawMessage.topic, message = b64DecodeDefault rawMessage.message }
 
 
 convertMessage : String -> SourceMessage -> Message
@@ -113,10 +152,15 @@ type alias StatsResponse =
     }
 
 
+defaultStatsResponse : StatsResponse
+defaultStatsResponse =
+    StatsResponse []
+
+
 statsResponseDecoder : Decoder StatsResponse
 statsResponseDecoder =
-    Decode.succeed StatsResponse
-        |> required "connectionStats" (list connectionStatsDecoder)
+    list connectionStatsDecoder
+        |> Decode.andThen (\connectionStats -> Decode.succeed (StatsResponse connectionStats))
 
 
 type alias ModuleInfo =
@@ -201,6 +245,18 @@ type MessageInput
     | InputFree InputFreeFields InputSXFields
 
 
+type alias Flags =
+    { time : Int
+    , zone : Int
+    }
+
+
+type alias InitialState =
+    { time : Time.Posix
+    , zone : Time.Zone
+    }
+
+
 type alias State =
     { stats : StatsResponse
     , time : Time.Posix
@@ -208,18 +264,39 @@ type alias State =
     , messages : List Message
     , devices : Dict Int Device
     , messageInput : MessageInput
+    , initialScan : InitialScan
     }
 
 
-type Model
-    = INIT (Maybe StatsResponse) (Maybe Time.Posix) (Maybe Time.Zone) (List Message) (Dict Int Device) Bool
+type InitialScan
+    = INITIAL_SCAN_WAIT_HISTORY_END
+    | INITIAL_SCAN_WAIT_STATS
+    | INITIAL_SCAN_DONE
+
+
+defaultState : Time.Posix -> Time.Zone -> State
+defaultState time zone =
+    { stats = defaultStatsResponse
+    , time = time
+    , zone = zone
+    , messages = []
+    , devices = Dict.empty
+    , messageInput = InputSX (InputSXFields "" "" "" "") (InputFreeFields "" "")
+    , initialScan = INITIAL_SCAN_WAIT_HISTORY_END
+    }
+
+
+type
+    Model
+    --= INIT (Maybe StatsResponse) (Maybe Time.Posix) (Maybe Time.Zone) (List Message) (Dict Int Device) Bool
+    = CONNECTING InitialState
     | READY State
     | ERROR_NET Http.Error
     | ERROR_DECODE Decode.Error
 
 
 type Msg
-    = GotStats (Result Http.Error StatsResponse)
+    = GotStats StatsResponse
     | Tick Time.Posix
     | Zone Time.Zone
     | Write String (Maybe String)
@@ -227,18 +304,21 @@ type Msg
     | InputDevice String
     | InputModule String
     | InputAddress String
+    | InputDeviceModule String String
     | InputData String
     | CmdSent (Result Http.Error ())
-    | SendWSMessage String
+      --| SendWSMessage String
     | ReceiveWSMessage String
+    | OpenWS ()
+    | CloseWS ()
     | CheckInitReady
     | EndHistory ()
     | NoOp ()
 
 
-init : () -> ( Model, Cmd Msg )
-init _ =
-    ( INIT Nothing Nothing Nothing [] Dict.empty False, Cmd.batch [ getStats, getTime, getZone ] )
+init : Flags -> ( Model, Cmd Msg )
+init flags =
+    ( CONNECTING { time = Time.millisToPosix flags.time, zone = Time.customZone flags.zone [] }, Cmd.batch [ getTime ] )
 
 
 
@@ -410,27 +490,32 @@ updateDevices maybeStats msg dict =
 
 processReceivedWSMessage : Maybe StatsResponse -> List Message -> Dict Int Device -> String -> Result Decode.Error ( List Message, Dict Int Device, Cmd Msg )
 processReceivedWSMessage stats messages devices wsmsg =
-    case decodeString sourceMessageDecoder wsmsg of
-        Ok decodedMessage ->
-            let
-                newMessage =
-                    convertMessage (String.fromInt <| List.length messages) decodedMessage
+    case decodeString rawMessageDecoder wsmsg of
+        Ok rawMessage ->
+            case rawMessage.topic of
+                [ "_meta", "stats", "" ] ->
+                    case decodeString statsResponseDecoder rawMessage.message of
+                        Ok statsResponse ->
+                            Ok ( messages, devices, Task.perform GotStats (Task.succeed statsResponse) )
 
-                newMessages =
-                    newMessage :: messages
+                        Err error ->
+                            Err error
 
-                ( updatedDevices, cmd ) =
-                    updateDevices stats newMessage devices
+                [ "_meta", "history", "end", "" ] ->
+                    Ok ( messages, devices, Task.perform EndHistory (Task.succeed ()) )
 
-                historyEndCmd =
-                    case decodedMessage.topic of
-                        [ "_meta", "history", "end", "" ] ->
-                            Task.perform EndHistory (Task.succeed ())
+                _ ->
+                    let
+                        newMessage =
+                            convertRawMessageToMessage (String.fromInt <| List.length messages) rawMessage
 
-                        _ ->
-                            Cmd.none
-            in
-            Ok ( newMessages, updatedDevices, Cmd.batch [ cmd, historyEndCmd ] )
+                        newMessages =
+                            newMessage :: messages
+
+                        ( updatedDevices, cmd ) =
+                            updateDevices stats newMessage devices
+                    in
+                    Ok ( newMessages, updatedDevices, cmd )
 
         Err error ->
             Err error
@@ -439,6 +524,7 @@ processReceivedWSMessage stats messages devices wsmsg =
 readMessageLength : Int -> String
 readMessageLength length =
     B64Encode.encode <| B64Encode.string <| fromChar <| fromCode length
+
 
 toSXTopic : Int -> Int -> Int -> String
 toSXTopic deviceId moduleId address =
@@ -449,18 +535,36 @@ requestAddressRead : Int -> Int -> Int -> Int -> Cmd Msg
 requestAddressRead deviceId moduleId address length =
     postPub (toSXTopic deviceId moduleId address) (readMessageLength length)
 
+
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case model of
+        CONNECTING initialState ->
+            case msg of
+                OpenWS _ ->
+                    ( READY <| defaultState initialState.time initialState.zone, Cmd.none )
+
+                Tick t ->
+                    ( CONNECTING { initialState | time = t }, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
         READY state ->
             case msg of
-                GotStats result ->
-                    case result of
-                        Ok stats ->
-                            ( READY { state | stats = stats }, Cmd.none )
+                OpenWS _ ->
+                    ( READY <| defaultState state.time state.zone, Cmd.none )
 
-                        Err error ->
-                            ( ERROR_NET error, Cmd.none )
+                CloseWS () ->
+                    ( CONNECTING { time = state.time, zone = state.zone }, Cmd.none )
+
+                GotStats stats ->
+                    case state.initialScan of
+                        INITIAL_SCAN_WAIT_STATS ->
+                            ( READY { state | stats = stats, initialScan = INITIAL_SCAN_DONE }, scanDeviceModules stats (Dict.values state.devices) )
+
+                        _ ->
+                            ( READY { state | stats = stats }, Cmd.none )
 
                 Tick t ->
                     ( READY { state | time = t }, getStats )
@@ -477,46 +581,65 @@ update msg model =
                     case maybeTopic of
                         Just topic ->
                             ( model, postPub topic message )
-                        Nothing ->
-                            ( model, Cmd.none)
 
+                        Nothing ->
+                            ( model, Cmd.none )
 
                 InputDevice inputDevice ->
                     case state.messageInput of
                         InputSX fields other ->
-                            ( READY { state | messageInput = InputSX {fields | inputDevice = inputDevice} other }, Cmd.none )
+                            ( READY { state | messageInput = InputSX { fields | inputDevice = inputDevice } other }, Cmd.none )
+
                         _ ->
-                            ( model, Cmd.none)
+                            ( model, Cmd.none )
 
                 InputModule inputModule ->
                     case state.messageInput of
                         InputSX fields other ->
-                            ( READY { state | messageInput = InputSX {fields | inputModule = inputModule} other }, Cmd.none )
+                            ( READY { state | messageInput = InputSX { fields | inputModule = inputModule } other }, Cmd.none )
+
                         _ ->
-                            ( model, Cmd.none)
+                            ( model, Cmd.none )
+                InputDeviceModule inputDevice inputModule ->
+                    case state.messageInput of
+                        InputSX fields other ->
+                            ( READY { state | messageInput = InputSX { fields | inputDevice = inputDevice, inputModule = inputModule } other }, Cmd.none)
+                        _ ->
+                            (model, Cmd.none)
 
                 InputAddress inputAddress ->
                     case state.messageInput of
                         InputSX fields other ->
-                            ( READY { state | messageInput = InputSX {fields | inputAddress = inputAddress} other }, Cmd.none )
+                            ( READY { state | messageInput = InputSX { fields | inputAddress = inputAddress } other }, Cmd.none )
+
                         _ ->
-                            ( model, Cmd.none)
+                            ( model, Cmd.none )
 
                 InputData inputData ->
                     case state.messageInput of
                         InputSX fields other ->
-                            ( READY { state | messageInput = InputSX {fields | inputData = inputData} other }, Cmd.none )
+                            ( READY { state | messageInput = InputSX { fields | inputData = inputData } other }, Cmd.none )
+
                         _ ->
-                            ( model, Cmd.none)
+                            ( model, Cmd.none )
 
                 CmdSent _ ->
                     ( model, Cmd.none )
 
-                SendWSMessage wsmsg ->
-                    ( model, sendWSMessage wsmsg )
-
+                --SendWSMessage wsmsg ->
+                --    ( model, sendWSMessage wsmsg )
                 ReceiveWSMessage wsmsg ->
-                    case processReceivedWSMessage (Just state.stats) state.messages state.devices wsmsg of
+                    let
+                        -- Provide stats if we have received history
+                        stats =
+                            case state.initialScan of
+                                INITIAL_SCAN_DONE ->
+                                    Just state.stats
+
+                                _ ->
+                                    Nothing
+                    in
+                    case processReceivedWSMessage stats state.messages state.devices wsmsg of
                         Ok ( messages, devices, cmd ) ->
                             ( READY { state | messages = messages, devices = devices }, cmd )
 
@@ -533,45 +656,7 @@ update msg model =
                     ( model, Cmd.none )
 
                 EndHistory () ->
-                    ( model, Cmd.none )
-
-        INIT maybeStats maybeTime maybeZone messages devices historyEnd ->
-            case msg of
-                GotStats result ->
-                    case result of
-                        Ok stats ->
-                            update CheckInitReady (INIT (Just stats) maybeTime maybeZone messages devices historyEnd)
-
-                        Err error ->
-                            ( ERROR_NET error, Cmd.none )
-
-                Tick t ->
-                    update CheckInitReady (INIT maybeStats (Just t) maybeZone messages devices historyEnd)
-
-                Zone z ->
-                    update CheckInitReady (INIT maybeStats maybeTime (Just z) messages devices historyEnd)
-
-                ReceiveWSMessage wsmsg ->
-                    case processReceivedWSMessage Nothing messages devices wsmsg of
-                        Ok ( newMessages, newDevices, cmd ) ->
-                            ( INIT maybeStats maybeTime maybeZone newMessages newDevices historyEnd, cmd )
-
-                        Err error ->
-                            ( ERROR_DECODE error, Cmd.none )
-
-                CheckInitReady ->
-                    case model of
-                        INIT (Just stats) (Just time) (Just zone) _ _ True ->
-                            ( READY (State stats time zone messages devices (InputSX (InputSXFields "" "" "" "") (InputFreeFields "" ""))), scanDeviceModules stats (Dict.values devices) )
-
-                        _ ->
-                            ( model, Cmd.none )
-
-                EndHistory () ->
-                    update CheckInitReady (INIT maybeStats maybeTime maybeZone messages devices True)
-
-                _ ->
-                    ( model, Cmd.none )
+                    ( READY { state | initialScan = INITIAL_SCAN_WAIT_STATS }, Cmd.none )
 
         ERROR_NET _ ->
             ( model, Cmd.none )
@@ -650,8 +735,8 @@ viewModuleInfo info =
         ]
 
 
-viewDeviceModule : Module -> Html Msg
-viewDeviceModule deviceModule =
+viewDeviceModule : String -> Module -> Html Msg
+viewDeviceModule sDeviceId deviceModule =
     let
         sModuleId =
             String.fromInt deviceModule.twiAddress
@@ -659,12 +744,12 @@ viewDeviceModule deviceModule =
         name =
             moduleName <| moduleTypeFromId deviceModule.info.moduleId
     in
-    li [ onClick (InputModule sModuleId) ] [ span [] [ text name ], viewModuleInfo deviceModule.info ]
+    li [ ] [ span [class "link", onClick (InputDeviceModule sDeviceId sModuleId) ] [ text name ], viewModuleInfo deviceModule.info ]
 
 
-viewDeviceModules : List Module -> Html Msg
-viewDeviceModules modules =
-    ul [] <| List.map viewDeviceModule modules
+viewDeviceModules : String -> List Module -> Html Msg
+viewDeviceModules sDeviceId modules =
+    ul [] <| List.map (viewDeviceModule sDeviceId) modules
 
 
 isSockAddrDeviceId : String -> Int -> Bool
@@ -701,8 +786,8 @@ viewDeviceInformation state ( _, device ) =
                 " [OFFLINE]"
     in
     div [ class "device" ]
-        [ h3 [ onClick (InputDevice sDeviceId) ] [ text <| deviceName device.id ++ " (" ++ sDeviceId ++ ")" ++ offlineText ]
-        , viewDeviceModules <| Dict.values device.modules
+        [ h3 [ class "link", onClick (InputDevice sDeviceId) ] [ text <| deviceName device.id ++ " (" ++ sDeviceId ++ ")" ++ offlineText ]
+        , viewDeviceModules sDeviceId <| Dict.values device.modules
         ]
 
 
@@ -812,24 +897,31 @@ viewInput state =
             case state.messageInput of
                 InputSX fields _ ->
                     let
-                        writeTopic = ("sx/" ++ fields.inputDevice ++ "/i/w/" ++ fields.inputModule ++ "/" ++ fields.inputAddress ++ "/")
-                        writeMessage = fromHex fields.inputData |> Maybe.andThen (\x -> Just <| B64Encode.encode <| B64Encode.bytes <| encodeListToBytes x)
+                        writeTopic =
+                            "sx/" ++ fields.inputDevice ++ "/i/w/" ++ fields.inputModule ++ "/" ++ fields.inputAddress ++ "/"
+
+                        writeMessage =
+                            fromHex fields.inputData |> Maybe.andThen (\x -> Just <| B64Encode.encode <| B64Encode.bytes <| encodeListToBytes x)
+
                         readTopic =
                             case ( String.toInt fields.inputDevice, String.toInt fields.inputModule, String.toInt fields.inputAddress ) of
                                 ( Just deviceId, Just moduleId, Just address ) ->
                                     Just <| toSXTopic deviceId moduleId address
+
                                 _ ->
                                     Nothing
 
-                        readMessage = readMessageLength 1
+                        readMessage =
+                            readMessageLength 1
                     in
                     [ input [ placeholder "Device", value fields.inputDevice, onInput InputDevice ] []
                     , input [ placeholder "Module", value fields.inputModule, onInput InputModule ] []
                     , input [ placeholder "Address", value fields.inputAddress, onInput InputAddress ] []
                     , input [ placeholder "Data", value fields.inputData, onInput InputData ] []
                     , button [ onClick (ReadSX readTopic readMessage), disabled (readTopic == Nothing) ] [ text "Read" ]
-                    , button [ onClick (Write writeTopic writeMessage), disabled (writeMessage == Nothing)] [ text "Write" ]
+                    , button [ onClick (Write writeTopic writeMessage), disabled (writeMessage == Nothing) ] [ text "Write" ]
                     ]
+
                 InputFree fields _ ->
                     [ input [ placeholder "Topic", value fields.inputTopic, onInput InputDevice ] []
                     , input [ placeholder "Data", value fields.inputData, onInput InputData ] []
@@ -838,11 +930,10 @@ viewInput state =
     div [] inputs
 
 
-
 view : Model -> Document Msg
 view model =
     case model of
-        INIT _ _ _ _ _ _ ->
+        CONNECTING _ ->
             { title = "SpyBus 2000 - Booting up", body = [ div [] [ text "Hold on to your pants" ] ] }
 
         READY state ->
@@ -877,10 +968,16 @@ view model =
 -- PORTS
 
 
-port sendWSMessage : String -> Cmd msg
+port sendWSMessage : Json.Encode.Value -> Cmd msg
 
 
 port receiveWSMessage : (String -> msg) -> Sub msg
+
+
+port openWS : (() -> msg) -> Sub msg
+
+
+port closeWS : (() -> msg) -> Sub msg
 
 
 
@@ -892,6 +989,8 @@ subscriptions m =
     Sub.batch
         [ Time.every 1000 Tick
         , receiveWSMessage ReceiveWSMessage
+        , openWS OpenWS
+        , closeWS CloseWS
         ]
 
 
@@ -901,10 +1000,11 @@ subscriptions m =
 
 getStats : Cmd Msg
 getStats =
-    Http.get
-        { url = "http://localhost:18080/stats"
-        , expect = Http.expectJson GotStats statsResponseDecoder
-        }
+    --Http.get
+    --    { url = "http://localhost:18080/stats"
+    --    , expect = Http.expectJson GotStats statsResponseDecoder
+    --    }
+    sendWSMessage <| sourceMessageEncoder (SourceMessage (Time.millisToPosix 0) [ "_meta", "stats", "" ] Nothing)
 
 
 postPub : String -> String -> Cmd Msg
@@ -938,12 +1038,13 @@ scanDevice : StatsResponse -> Device -> Cmd Msg
 scanDevice stats device =
     -- 246 = VREG_SIGROW_1
     -- isConnectedDevice device.id state
-    if isConnectedDevice device.id stats
-    then
+    if isConnectedDevice device.id stats then
         Dict.values device.modules
-        |> List.map (\m -> requestAddressRead device.id m.twiAddress 246 9)
-        |> Cmd.batch
-    else Cmd.none
+            |> List.map (\m -> requestAddressRead device.id m.twiAddress 246 9)
+            |> Cmd.batch
+
+    else
+        Cmd.none
 
 
 {-| Scans device modules for runtime information (memory, errors, mcu, debug..)
