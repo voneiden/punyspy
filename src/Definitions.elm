@@ -125,6 +125,24 @@ type Device
     = Device DeviceId (List Module)
 
 
+vregRegisters : List Register
+vregRegisters =
+    [ Register (Address 0xED) (Size 1) RW (Name "MODULE_ID")
+    , Register (Address 0xEE) (Size 1) RW (Name "MAC_ADDR")
+    , Register (Address 0xEF) (Size 1) RW (Name "TWI_ADDR")
+    , Register (Address 0xF6) (Size 1) RW (Name "SIGROW_1")
+    , Register (Address 0xF7) (Size 1) RW (Name "SIGROW_2")
+    , Register (Address 0xF8) (Size 1) RW (Name "SIGROW_3")
+    , Register (Address 0xF9) (Size 1) RW (Name "STACK_H")
+    , Register (Address 0xFA) (Size 1) RW (Name "STACK_L")
+    , Register (Address 0xFB) (Size 1) RW (Name "ERROR")
+    , Register (Address 0xFC) (Size 1) RW (Name "DEBUG1")
+    , Register (Address 0xFD) (Size 1) RW (Name "DEBUG2")
+    , Register (Address 0xFE) (Size 1) RW (Name "DEBUG3")
+    , Register (Address 0xFF) (Size 1) RW (Name "DEBUG")
+    ]
+
+
 moduleRegisters : Module -> List Register
 moduleRegisters moduleType =
     case moduleType of
@@ -156,7 +174,17 @@ moduleRegisters moduleType =
             ]
 
         MOD_IO ->
-            []
+            [ Register (Address 0x00) (Size 1) RW (Name "NOP")
+            , Register (Address 0x01) (Size 1) RW (Name "HIGH")
+            , Register (Address 0x02) (Size 1) RW (Name "INPUTS")
+            , Register (Address 0x03) (Size 1) RW (Name "OUTPUTS1")
+            , Register (Address 0x04) (Size 1) RW (Name "OUTPUTS2")
+            , Register (Address 0x05) (Size 1) RW (Name "DEBOUNCE_MS")
+            , Register (Address 0x06) (Size 1) RW (Name "EVENT_COUNT")
+            , Register (Address 0x07) (Size 1) RW (Name "EVENT")
+            , Register (Address 0x08) (Size 1) RW (Name "STATES_START")
+            ]
+                ++ vregRegisters
 
         MOD_UNKNOWN ->
             []

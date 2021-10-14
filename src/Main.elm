@@ -7,7 +7,7 @@ import Bytes exposing (Bytes)
 import Bytes.Decode
 import Bytes.Encode as BEncode
 import Char exposing (fromCode)
-import Definitions exposing (deviceName, mcuName, mcuRam, moduleName, moduleTypeFromId, signatureToMCU)
+import Definitions exposing (Address(..), Name(..), Register(..), deviceName, mcuName, mcuRam, moduleName, moduleRegisters, moduleTypeFromId, signatureToMCU)
 import Dict exposing (Dict)
 import Hex exposing (fromHex, maybeToHex, toHex)
 import Html exposing (Attribute, Html, button, div, h1, h3, input, li, span, table, tbody, td, text, th, thead, tr, ul)
@@ -600,12 +600,14 @@ update msg model =
 
                         _ ->
                             ( model, Cmd.none )
+
                 InputDeviceModule inputDevice inputModule ->
                     case state.messageInput of
                         InputSX fields other ->
-                            ( READY { state | messageInput = InputSX { fields | inputDevice = inputDevice, inputModule = inputModule } other }, Cmd.none)
+                            ( READY { state | messageInput = InputSX { fields | inputDevice = inputDevice, inputModule = inputModule } other }, Cmd.none )
+
                         _ ->
-                            (model, Cmd.none)
+                            ( model, Cmd.none )
 
                 InputAddress inputAddress ->
                     case state.messageInput of
@@ -736,20 +738,41 @@ viewModuleInfo info =
 
 
 viewDeviceModule : String -> Module -> Html Msg
-viewDeviceModule sDeviceId deviceModule =
+viewDeviceModule selectedModule deviceModule =
     let
         sModuleId =
             String.fromInt deviceModule.twiAddress
 
         name =
             moduleName <| moduleTypeFromId deviceModule.info.moduleId
+
+        registers =
+            if selectedModule == sModuleId then
+                viewModuleRegisters deviceModule.info
+
+            else
+                text ""
     in
-    li [ ] [ span [class "link", onClick (InputDeviceModule sDeviceId sModuleId) ] [ text name ], viewModuleInfo deviceModule.info ]
+    li []
+        [ span [ class "link", onClick (InputModule sModuleId) ] [ text name ]
+        , viewModuleInfo deviceModule.info
+        , registers
+        ]
+
+
+viewModuleRegisters : ModuleInfo -> Html Msg
+viewModuleRegisters moduleInfo =
+    ul [] [ ul [] <| List.map viewModuleRegister <| moduleRegisters <| moduleTypeFromId moduleInfo.moduleId ]
+
+
+viewModuleRegister : Register -> Html Msg
+viewModuleRegister (Register (Address address) size direction (Name name)) =
+    li [ class "link", onClick (InputAddress (String.fromInt address)) ] [ text name ]
 
 
 viewDeviceModules : String -> List Module -> Html Msg
-viewDeviceModules sDeviceId modules =
-    ul [] <| List.map (viewDeviceModule sDeviceId) modules
+viewDeviceModules selectedModule modules =
+    ul [] <| List.map (viewDeviceModule selectedModule) modules
 
 
 isSockAddrDeviceId : String -> Int -> Bool
@@ -784,10 +807,22 @@ viewDeviceInformation state ( _, device ) =
 
             else
                 " [OFFLINE]"
+
+        modules =
+            case state.messageInput of
+                InputSX fields _ ->
+                    if fields.inputDevice == sDeviceId then
+                        viewDeviceModules fields.inputModule <| Dict.values device.modules
+
+                    else
+                        text ""
+
+                _ ->
+                    text ""
     in
     div [ class "device" ]
         [ h3 [ class "link", onClick (InputDevice sDeviceId) ] [ text <| deviceName device.id ++ " (" ++ sDeviceId ++ ")" ++ offlineText ]
-        , viewDeviceModules sDeviceId <| Dict.values device.modules
+        , modules
         ]
 
 
